@@ -1,0 +1,145 @@
+import { config as dotenv } from "dotenv";
+import {
+  createWalletClient,
+  http,
+  getContract,
+  erc20Abi,
+  parseUnits,
+  maxUint256,
+  publicActions,
+  concat,
+  numberToHex,
+  size,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { scroll } from "viem/chains";
+import { wethAbi } from "./abi/weth-abi";
+
+dotenv();
+const { PRIVATE_KEY, ZERO_EX_API_KEY, ALCHEMY_HTTP_TRANSPORT_URL } = process.env;
+
+if (!PRIVATE_KEY || !ZERO_EX_API_KEY || !ALCHEMY_HTTP_TRANSPORT_URL) {
+  throw new Error("Missing environment variables.");
+}
+
+const headers = new Headers({
+  "Content-Type": "application/json",
+  "0x-api-key": ZERO_EX_API_KEY,
+  "0x-version": "v2",
+});
+
+const client = createWalletClient({
+  account: privateKeyToAccount(`0x${PRIVATE_KEY}` as `0x${string}`),
+  chain: scroll,
+  transport: http(ALCHEMY_HTTP_TRANSPORT_URL),
+}).extend(publicActions);
+
+const weth = getContract({
+  address: "0x5300000000000000000000000000000000000004",
+  abi: wethAbi,
+  client,
+});
+
+const wsteth = getContract({
+  address: "0xf610A9dfB7C89644979b4A0f27063E9e7d7Cda32",
+  abi: erc20Abi,
+  client,
+});
+
+// Fetching liquidity sources
+const getLiquiditySources = async () => {
+  try {
+    const sourcesResponse = await fetch(`https://api.0x.org/swap/v1/sources?chainId=${client.chain.id}`, { headers });
+    const { sources } = await sourcesResponse.json();
+    console.log("Liquidity sources:", Object.keys(sources).join(", "));
+  } catch (error) {
+    console.error("Error fetching liquidity sources:", error);
+  }
+};
+
+// Display liquidity breakdown
+const displayLiquiditySources = (route: any) => {
+  const totalBps = route.fills.reduce((acc: number, fill: any) => acc + parseInt(fill.proportionBps), 0);
+  route.fills.forEach((fill: any) => {
+    console.log(`${fill.source}: ${(parseInt(fill.proportionBps) / totalBps * 100).toFixed(2)}%`);
+  });
+};
+
+// Display token taxes
+const displayTokenTaxes = ({ buyToken, sellToken }: any) => {
+  const formatTax = (taxBps: any) => (parseInt(taxBps) / 100).toFixed(2);
+  if (buyToken.buyTaxBps > 0 || buyToken.sellTaxBps > 0) {
+    console.log(`Buy Token Buy Tax: ${formatTax(buyToken.buyTaxBps)}%`);
+    console.log(`Buy Token Sell Tax: ${formatTax(buyToken.sellTaxBps)}%`);
+  }
+  if (sellToken.buyTaxBps > 0 || sellToken.sellTaxBps > 0) {
+    console.log(`Sell Token Buy Tax: ${formatTax(sellToken.buyTaxBps)}%`);
+    console.log(`Sell Token Sell Tax: ${formatTax(sellToken.sellTaxBps)}%`);
+  }
+};
+
+// Fetch price and handle monetization
+const fetchPriceAndMonetize = async (sellAmount: string) => {
+  try {
+    const priceParams = new URLSearchParams({
+      chainId: client.chain.id.toString(),
+      sellToken: weth.address,
+      buyToken: wsteth.address,
+      sellAmount,
+      taker: client.account.address,
+      affiliateFee: "100", // 1% affiliate fee
+      surplusCollection: "true",
+    });
+
+    const priceResponse = await fetch(`https://api.0x.org/swap/permit2/price?${priceParams.toString()}`, { headers });
+    const price = await priceResponse.json();
+
+    // Approve Permit2 if necessary
+    if (price.issues?.allowance) {
+      const { request } = await weth.simulate.approve([price.issues.allowance.spender, maxUint256]);
+      const hash = await weth.write.approve(request.args);
+      console.log("Approved Permit2:", await client.waitForTransactionReceipt({ hash }));
+    }
+
+    return price;
+  } catch (error) {
+    console.error("Error fetching price:", error);
+  }
+};
+
+// Handle transaction signing
+const handleTransaction = async (quote: any, signature: string) => {
+  try {
+    const nonce = await client.getTransactionCount({ address: client.account.address });
+    const signedTransaction = await client.signTransaction({
+      account: client.account,
+      chain: client.chain,
+      gas: BigInt(quote.transaction.gas),
+      to: quote.transaction.to,
+      data: quote.transaction.data,
+      nonce,
+    });
+    const hash = await client.sendRawTransaction({ serializedTransaction: signedTransaction });
+    console.log("Transaction hash:", hash);
+  } catch (error) {
+    console.error("Error sending transaction:", error);
+  }
+};
+
+const main = async () => {
+  await getLiquiditySources();
+
+  const decimals = await weth.read.decimals();
+  const sellAmount = parseUnits("0.1", decimals).toString();
+
+  const price = await fetchPriceAndMonetize(sellAmount);
+  if (price?.route) displayLiquiditySources(price.route);
+  if (price?.tokenMetadata) displayTokenTaxes(price.tokenMetadata);
+
+  const signature = await client.signTypedData(price.permit2.eip712);
+  price.transaction.data = concat([price.transaction.data, numberToHex(size(signature), { signed: false, size: 32 }), signature]);
+
+  await handleTransaction(price, signature);
+};
+
+main();
